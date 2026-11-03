@@ -1,12 +1,12 @@
 name: CI
 
 on:
-  push:
-    branches:
-      - master
-  pull_request:
-    branches:
-      - master
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: 'Surefire -Dtest selector; empty runs the full suite'
+        required: false
+        default: ''
 
 permissions:
   contents: read
@@ -18,6 +18,7 @@ jobs:
       contents: read  # for actions/checkout to fetch code
     name: "${{ matrix.root-pom }} on JDK ${{ matrix.java }} on ${{ matrix.os }}"
     strategy:
+      fail-fast: false
       matrix:
         os: [ ubuntu-latest ]
         java: [ 8, 11, 17 ]
@@ -27,6 +28,7 @@ jobs:
             java: 17
             root-pom: pom.xml
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 50
     env:
       ROOT_POM: ${{ matrix.root-pom }}
     steps:
@@ -49,18 +51,119 @@ jobs:
         run: mvn -B -Dorg.slf4j.simpleLogger.log.org.apache.maven.cli.transfer.Slf4jMavenTransferListener=warn install -U -DskipTests=true -f $ROOT_POM
       - name: 'Test'
         shell: bash
-        run: mvn -B -P!standard-with-extra-repos verify -U -Dmaven.javadoc.skip=true -f $ROOT_POM
+        run: |
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            mvn -B -P!standard-with-extra-repos verify -U -Dmaven.javadoc.skip=true -f $ROOT_POM -Dtest='${{ inputs.test-filter }}' -DfailIfNoTests=false
+          else
+            mvn -B -P!standard-with-extra-repos verify -U -Dmaven.javadoc.skip=true -f $ROOT_POM
+          fi
       - name: 'Print Surefire reports'
         # Note: Normally a step won't run if the job has failed, but this causes it to
         if: ${{ failure() }}
         shell: bash
         run: ./util/print_surefire_reports.sh
+      - name: 'Print skipped tests with reasons'
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          PY=python3; command -v python3 >/dev/null 2>&1 || PY=python
+          cat > "$RUNNER_TEMP/print_skipped_tests.py" <<'EOF'
+          #!/usr/bin/env python3
+          """Print every skipped Surefire test case with its reason, plus per-module totals.
+
+          Surefire 2.7.2 records Truth/JUnit assume() skips as a bare <skipped/>, so for
+          each skipped case without a message this looks up the test method in the test
+          sources and prints the assume()/Ignore line that skips it.
+          """
+          import glob
+          import os
+          import re
+          import xml.etree.ElementTree as ET
+
+          reports = sorted(
+              glob.glob("*/target/surefire-reports/TEST-*.xml")
+              + glob.glob("android/*/target/surefire-reports/TEST-*.xml")
+          )
+
+          sources = {}
+          cache = {}
+
+
+          def method_reason(name):
+              if name not in cache:
+                  cache[name] = _method_reason(name)
+              return cache[name]
+
+
+          def _method_reason(name):
+              # Parameterized cases are reported as "method[params]".
+              name = name.split("[", 1)[0]
+              if not sources:
+                  for path in glob.glob("**/test/**/*.java", recursive=True):
+                      try:
+                          with open(path, encoding="utf-8") as f:
+                              sources[path] = f.read().splitlines()
+                      except OSError:
+                          pass
+              pat = re.compile(r"\bvoid\s+" + re.escape(name) + r"\s*\(")
+              for path, lines in sources.items():
+                  for i, line in enumerate(lines):
+                      if pat.search(line):
+                          hits = [
+                              lines[j].strip()
+                              for j in range(max(0, i - 3), min(len(lines), i + 10))
+                              if re.search(r"assume|@Ignore|@Disabled", lines[j])
+                          ]
+                          if hits:
+                              return "assumption not met for this parameterization (%s: %s)" % (
+                                  os.path.basename(path),
+                                  " ".join(hits),
+                              )
+              return None
+
+
+          totals = {}
+          for report in reports:
+              module = report.replace("\\", "/").split("/target/")[0]
+              root = ET.parse(report).getroot()
+              t = totals.setdefault(module, [0, 0, 0, 0])
+              t[0] += int(root.get("tests", 0))
+              t[1] += int(root.get("failures", 0))
+              t[2] += int(root.get("errors", 0))
+              t[3] += int(root.get("skipped", 0))
+              for case in root.iter("testcase"):
+                  skipped = case.find("skipped")
+                  if skipped is None:
+                      continue
+                  reason = skipped.get("message") or (skipped.text or "").strip()
+                  if not reason:
+                      reason = method_reason(case.get("name", "")) or "no reason recorded"
+                  print(
+                      "SKIPPED %s.%s -- %s"
+                      % (case.get("classname"), case.get("name"), reason)
+                  )
+
+          for module, (tests, failures, errors, skipped) in sorted(totals.items()):
+              print(
+                  "SUMMARY %s: Tests run: %d, Passed: %d, Failures: %d, Errors: %d, Skipped: %d"
+                  % (module, tests, tests - failures - errors - skipped, failures, errors, skipped)
+              )
+          EOF
+          $PY "$RUNNER_TEMP/print_skipped_tests.py"
+      - name: 'Upload guava jar'
+        if: ${{ matrix.root-pom == 'pom.xml' && matrix.java == 11 && matrix.os == 'ubuntu-latest' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: guava-jar
+          path: guava/target/guava-*-jre.jar
+          if-no-files-found: error
 
   publish_snapshot:
     name: 'Publish snapshot'
     needs: test
     if: github.event_name == 'push' && github.repository == 'google/guava'
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - name: 'Check out repository'
         uses: actions/checkout@8e5e7e5ab8b370d6c329ec480221332ada57f0ab
@@ -87,6 +190,7 @@ jobs:
     needs: test
     if: github.event_name == 'push' && github.repository == 'google/guava'
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - name: 'Check out repository'
         uses: actions/checkout@8e5e7e5ab8b370d6c329ec480221332ada57f0ab
